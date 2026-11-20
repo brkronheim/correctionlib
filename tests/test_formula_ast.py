@@ -33,3 +33,39 @@ def test_access_formula_ast():
     assert ast.children[1].children[0].nodetype == core.FormulaAst.NodeType.VARIABLE
     # the index of variable x in the inputs
     assert ast.children[1].children[0].data == 0
+
+
+def test_repeated_formula_rebinds_inputs_and_parameters():
+    import json
+
+    import pytest
+
+    def load(variable, parameters, expression="x+[0]"):
+        item = {
+            "name": "corr",
+            "version": 1,
+            "inputs": [{"name": name, "type": "real"} for name in ("pt", "eta")],
+            "output": {"name": "out", "type": "real"},
+            "data": {
+                "nodetype": "formula",
+                "parser": "TFormula",
+                "expression": expression,
+                "variables": [variable],
+                "parameters": parameters,
+            },
+        }
+        return core.CorrectionSet.from_string(
+            json.dumps({"schema_version": 2, "corrections": [item]})
+        )["corr"]
+
+    first = load("pt", [4.0])
+    second = load("eta", [7.0])
+    with pytest.raises(RuntimeError, match="Insufficient parameters"):
+        load("pt", [])
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="Failed to parse"):
+            load("pt", [], "?")
+    third = load("eta", [-3.0])
+    assert [corr.evaluate(10.0, 2.0) for corr in (first, second, third)] == [
+        14.0, 9.0, -1.0
+    ]

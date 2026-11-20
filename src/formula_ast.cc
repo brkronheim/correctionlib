@@ -20,6 +20,12 @@ namespace {
         parser_.enable_packrat_parsing();
       };
       AstPtr parse(const std::string_view expression) {
+        // Bin-local formulas often differ only in their bound parameters. PEG
+        // tokens refer to the source text, so own the text with the cached tree.
+        // The caller holds m through translation with its own binding context.
+        if (last_ast_ && expression == last_expression_) return last_ast_;
+        last_ast_.reset();
+        last_expression_.assign(expression);
         AstPtr peg_ast;
         int pos;
         std::string msg;
@@ -27,7 +33,7 @@ namespace {
           pos = col;
           msg = themsg;
         };
-        if ( ! parser_.parse(expression, peg_ast) ) {
+        if ( ! parser_.parse(last_expression_, peg_ast) ) {
           throw std::runtime_error(
             "Failed to parse Formula expression at position " + std::to_string(pos) + ":\n"
             + std::string(expression) + "\n"
@@ -35,12 +41,14 @@ namespace {
             + msg
           );
         }
-        peg_ast = parser_.optimize_ast(peg_ast);
-        return peg_ast;
+        last_ast_ = parser_.optimize_ast(peg_ast);
+        return last_ast_;
       };
 
     private:
       peg::parser parser_;
+      std::string last_expression_;
+      AstPtr last_ast_;
   };
 
   PEGParser tformula_parser(R"(

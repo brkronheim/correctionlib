@@ -8,6 +8,7 @@
 #include <rapidjson/filereadstream.h>
 #include <rapidjson/error/en.h>
 #include <optional>
+#include <deque>
 #include <algorithm>
 #include <stdexcept>
 #include <cmath>
@@ -146,7 +147,52 @@ namespace {
     const std::vector<Variable::Type>& values;
   };
 
-  std::size_t find_bin_idx(Variable::Type value_variant,
+  // Per-thread scratch storage for Transform::evaluate.
+  // Depth indexing keeps nested Transform evaluations re-entrant-safe.
+  class TransformScratch {
+  public:
+    explicit TransformScratch(const std::vector<Variable::Type>& values):
+      slot_(acquire_slot())
+    {
+      slot_ = values;
+      ++depth_;
+    }
+
+    ~TransformScratch() {
+      release_slot();
+    }
+
+    std::vector<Variable::Type>& values() {
+      return slot_;
+    }
+
+  private:
+    static std::vector<Variable::Type>& acquire_slot() {
+      if (depth_ == slots_.size()) {
+        slots_.emplace_back();
+      }
+      return slots_[depth_];
+    }
+
+    static void release_slot() {
+      depth_--;
+    }
+
+    std::vector<Variable::Type>& slot_;
+    static thread_local std::deque<std::vector<Variable::Type>> slots_;
+    static thread_local std::size_t depth_;
+  };
+
+  thread_local std::deque<std::vector<Variable::Type>> TransformScratch::slots_;
+  thread_local std::size_t TransformScratch::depth_ = 0;
+
+  double clampedAffine(double x, const double* p) {
+    // Keep the multiply and addition independently rounded as in FormulaAst.
+    volatile double product = p[0] * std::max(std::min(x, p[3]), p[2]);
+    return product + p[1];
+  }
+
+  std::size_t find_bin_idx(const Variable::Type& value_variant,
                            const std::variant<_UniformBins, _NonUniformBins> &bins_,
                            const _FlowBehavior &flow,
                            std::size_t variableIdx,
@@ -184,7 +230,7 @@ namespace {
 
     // otherwise we have non-uniform binning
     using namespace std::string_literals;
-    const auto bins = std::get<_NonUniformBins>(bins_);
+    const auto& bins = std::get<_NonUniformBins>(bins_);
     if ( flow == _FlowBehavior::wrap ) {
       double low = bins[0];
       double high = bins[bins.size() - 1];
@@ -343,6 +389,8 @@ Formula::Formula(const JSONObject& json, const std::vector<Variable>& inputs, bo
     }
   }
 
+  if (generic && variableIdx.size() == 1 && expression_ == "[0]*max(min(x,[3]),[2])+[1]")
+    affineVariable_ = static_cast<int>(variableIdx.front());
   ast_ = std::make_unique<FormulaAst>(FormulaAst::parse(type_, expression_, params, variableIdx, !generic));
 }
 
@@ -367,6 +415,8 @@ double Formula::evaluate(const std::vector<Variable::Type>& values) const {
 }
 
 double Formula::evaluate(const std::vector<Variable::Type>& values, const std::vector<double>& params) const {
+  if (affineVariable_ >= 0 && params.size() >= 4)
+    return clampedAffine(std::get<double>(values[affineVariable_]), params.data());
   return ast_->evaluate(values, params);
 }
 
@@ -392,7 +442,8 @@ Transform::Transform(const JSONObject& json, const Correction& context) {
 }
 
 double Transform::evaluate(const std::vector<Variable::Type>& values) const {
-  std::vector<Variable::Type> new_values(values);
+  TransformScratch scratch(values);
+  auto& new_values = scratch.values();
   double vnew = std::visit(node_evaluate{values}, *rule_);
   auto& v = new_values[variableIdx_];
   if ( std::holds_alternative<double>(v) ) {
@@ -502,6 +553,7 @@ Binning::Binning(const JSONObject& json, const Correction& context)
   }
 
   // set bin contents
+  contents_.reserve(content.Size() + 1);
   for (size_t i=0; i < content.Size(); ++i)
     contents_.push_back(resolve_content(content[i], context));
   contents_.push_back(std::move(default_value));
@@ -641,27 +693,25 @@ Category::Category(const JSONObject& json, const Correction& context)
 double Category::evaluate(const std::vector<Variable::Type>& values) const {
   const Content* child = nullptr;
   if ( auto pval = std::get_if<std::string>(&values[variableIdx_]) ) {
-    try {
-      child = &std::get<StrMap>(map_).at(*pval);
-    } catch (std::out_of_range& ex) {
-      if ( default_ ) {
-        child = default_.get();
-      }
-      else {
-        throw std::out_of_range("Index not available in Category for input argument " + std::to_string(variableIdx_) + " val: " + *pval);
-      }
+    const auto& m = std::get<StrMap>(map_);
+    auto it = m.find(*pval);
+    if ( it != m.end() ) {
+      child = &it->second;
+    } else if ( default_ ) {
+      child = default_.get();
+    } else {
+      throw std::out_of_range("Index not available in Category for input argument " + std::to_string(variableIdx_) + " val: " + *pval);
     }
   }
   else if ( auto pval = std::get_if<int>(&values[variableIdx_]) ) {
-    try {
-      child = &std::get<IntMap>(map_).at(*pval);
-    } catch (std::out_of_range& ex) {
-      if ( default_ ) {
-        child = default_.get();
-      }
-      else {
-        throw std::out_of_range("Index not available in Category for input argument " + std::to_string(variableIdx_) + " val: " + std::to_string(*pval));
-      }
+    const auto& m = std::get<IntMap>(map_);
+    auto it = m.find(*pval);
+    if ( it != m.end() ) {
+      child = &it->second;
+    } else if ( default_ ) {
+      child = default_.get();
+    } else {
+      throw std::out_of_range("Index not available in Category for input argument " + std::to_string(variableIdx_) + " val: " + std::to_string(*pval));
     }
   } else {
     throw std::runtime_error("Invalid variable type");
@@ -706,6 +756,70 @@ double Correction::evaluate(const std::vector<Variable::Type>& values) const {
     inputs_[i].validate(values[i]);
   }
   return std::visit(node_evaluate{values}, data_);
+}
+
+std::unique_ptr<BinnedFormulaGroup> BinnedFormulaGroup::prepare(
+    const std::vector<Correction::Ref>& sources) {
+  if (sources.size() < 2 || !sources.front()) return nullptr;
+  auto group = std::unique_ptr<BinnedFormulaGroup>(new BinnedFormulaGroup);
+  std::vector<const Binning*> tables;
+  for (const auto& source : sources) {
+    if (!source || source->inputs().size() != 2) return nullptr;
+    for (size_t i = 0; i < 2; ++i) {
+      if (source->inputs()[i].type() != Variable::VarType::real ||
+          source->inputs()[i].name() != sources.front()->inputs()[i].name()) return nullptr;
+    }
+    const auto* outer = std::get_if<Binning>(&source->data_);
+    if (!outer || outer->variableIdx_ != 0 || outer->flow_ != _FlowBehavior::value)
+      return nullptr;
+    const auto* edges = std::get_if<_NonUniformBins>(&outer->bins_);
+    const auto* fallback = std::get_if<double>(&outer->contents_.back());
+    if (!fallback || !edges || edges->size() < 2) return nullptr;
+    if (tables.empty()) group->outerEdges_ = *edges;
+    if (*edges != group->outerEdges_) return nullptr;
+    group->defaults_.push_back(*fallback);
+    tables.push_back(outer);
+  }
+
+  std::vector<const Binning*> rows(tables.size());
+  for (size_t i = 0; i + 1 < group->outerEdges_.size(); ++i) {
+    for (size_t k = 0; k < tables.size(); ++k) {
+      const auto* row = std::get_if<Binning>(&tables[k]->contents_[i]);
+      if (!row || row->variableIdx_ != 1 || row->flow_ != _FlowBehavior::clamp)
+        return nullptr;
+      const auto* edges = std::get_if<_NonUniformBins>(&row->bins_);
+      if (!edges || edges->size() < 2) return nullptr;
+      if (group->innerEdges_.empty()) group->innerEdges_ = *edges;
+      if (*edges != group->innerEdges_) return nullptr;
+      rows[k] = row;
+    }
+    for (size_t j = 0; j + 1 < group->innerEdges_.size(); ++j) {
+      for (const auto* row : rows) {
+        const auto* leaf = std::get_if<FormulaRef>(&row->contents_[j]);
+        if (!leaf || leaf->formula_->affineVariable_ != 1 || leaf->parameters_.size() != 4)
+          return nullptr;
+        std::array<double, 4> p;
+        std::copy_n(leaf->parameters_.begin(), p.size(), p.begin());
+        group->coefficients_.push_back(p);
+      }
+    }
+  }
+  return group;
+}
+
+void BinnedFormulaGroup::evaluate(double first, double second, double* outputs, size_t capacity) const {
+  if (!outputs || capacity < size()) throw std::invalid_argument("Insufficient grouped output storage");
+  const auto outer = std::upper_bound(outerEdges_.begin(), outerEdges_.end(), first);
+  if (outer == outerEdges_.begin() || outer == outerEdges_.end()) {
+    std::copy(defaults_.begin(), defaults_.end(), outputs);
+    return;
+  }
+  const size_t i = outer - outerEdges_.begin() - 1;
+  const auto inner = std::upper_bound(innerEdges_.begin(), innerEdges_.end(), second);
+  const auto bounded = std::clamp(inner, innerEdges_.begin() + 1, innerEdges_.end() - 1);
+  const size_t j = bounded - innerEdges_.begin() - 1;
+  const auto* row = coefficients_.data() + (i * (innerEdges_.size() - 1) + j) * size();
+  for (size_t k = 0; k < size(); ++k) outputs[k] = clampedAffine(second, row[k].data());
 }
 
 CompoundCorrection::CompoundCorrection(const JSONObject& json, const CorrectionSet& context) :
@@ -767,6 +881,12 @@ size_t CompoundCorrection::input_index(const std::string_view name) const {
 }
 
 double CompoundCorrection::evaluate(const std::vector<Variable::Type>& values) const {
+  static thread_local Workspace workspace;
+  return evaluate_with_workspace(values, workspace);
+}
+
+double CompoundCorrection::evaluate_with_workspace(const std::vector<Variable::Type>& values,
+                                                   Workspace& workspace) const {
   if ( values.size() > inputs_.size() ) {
     throw std::runtime_error("Too many inputs");
   }
@@ -776,8 +896,9 @@ double CompoundCorrection::evaluate(const std::vector<Variable::Type>& values) c
   for (size_t i=0; i < inputs_.size(); ++i) {
     inputs_[i].validate(values[i]);
   }
-  std::vector<Variable::Type> ivalues(values);
-  std::vector<Variable::Type> cvalues;
+  auto& ivalues = workspace.inputs;
+  auto& cvalues = workspace.component;
+  ivalues = values;
   cvalues.reserve(values.size());
   double out = 0.;
   double sf = 0.;

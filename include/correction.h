@@ -1,6 +1,7 @@
 #ifndef CORRECTION_H
 #define CORRECTION_H
 
+#include <array>
 #include <string>
 #include <vector>
 #include <variant>
@@ -136,10 +137,12 @@ class Formula {
     static Ref from_string(const char * data, std::vector<Variable>& inputs);
 
   private:
+    friend class BinnedFormulaGroup;
     std::string expression_;
     FormulaAst::ParserType type_;
     std::unique_ptr<FormulaAst> ast_;
     bool generic_;
+    int affineVariable_ = -1;
 };
 
 class FormulaRef {
@@ -148,6 +151,7 @@ class FormulaRef {
     double evaluate(const std::vector<Variable::Type>& values) const;
 
   private:
+    friend class BinnedFormulaGroup;
     Formula::Ref formula_;
     std::vector<double> parameters_;
 };
@@ -191,6 +195,7 @@ class Binning {
     double evaluate(const std::vector<Variable::Type>& values) const;
 
   private:
+    friend class BinnedFormulaGroup;
     std::variant<_UniformBins, _NonUniformBins> bins_; // bin edges
     // bin contents: contents_[i] is the value corresponding to bins_[i+1].
     // the default value is at contents_[0]
@@ -246,6 +251,7 @@ class Correction {
     double evaluate(const std::vector<Variable::Type>& values) const;
 
   private:
+    friend class BinnedFormulaGroup;
     std::string name_;
     std::string description_;
     int version_;
@@ -254,6 +260,21 @@ class Correction {
     std::vector<Formula::Ref> formula_refs_;
     bool initialized_; // is data_ filled?
     Content data_;
+};
+
+/// Prepared bin-major coefficients for two-dimensional clamped affine tables.
+class BinnedFormulaGroup {
+  public:
+    /// Returns null when the scalar corrections cannot share this representation.
+    static std::unique_ptr<BinnedFormulaGroup> prepare(const std::vector<Correction::Ref>& sources);
+    size_t size() const { return defaults_.size(); }
+    /// Arguments follow the original correction input order. Writes size() outputs.
+    void evaluate(double first, double second, double* outputs, size_t capacity) const;
+
+  private:
+    BinnedFormulaGroup() = default;
+    std::vector<double> outerEdges_, innerEdges_, defaults_;
+    std::vector<std::array<double, 4>> coefficients_;
 };
 
 typedef Correction::Ref CorrectionPtr; // deprecated
@@ -270,6 +291,12 @@ class CompoundCorrection {
     size_t input_index(const std::string_view name) const;
     const Variable& output() const { return output_; };
     double evaluate(const std::vector<Variable::Type>& values) const;
+    // Caller-owned temporaries can be reused across sequential evaluations.
+    struct Workspace {
+      std::vector<Variable::Type> inputs;
+      std::vector<Variable::Type> component;
+    };
+    double evaluate_with_workspace(const std::vector<Variable::Type>& values, Workspace& workspace) const;
 
   private:
     enum class UpdateOp {Add, Multiply, Divide, Last};
