@@ -1,3 +1,9 @@
+import json
+import math
+import struct
+
+import pytest
+
 import correctionlib._core as core
 from correctionlib import schemav2 as schema
 
@@ -36,10 +42,6 @@ def test_access_formula_ast():
 
 
 def test_repeated_formula_rebinds_inputs_and_parameters():
-    import json
-
-    import pytest
-
     def load(variable, parameters, expression="x+[0]"):
         item = {
             "name": "corr",
@@ -69,3 +71,40 @@ def test_repeated_formula_rebinds_inputs_and_parameters():
     assert [corr.evaluate(10.0, 2.0) for corr in (first, second, third)] == [
         14.0, 9.0, -1.0
     ]
+
+
+@pytest.mark.parametrize(("expression", "parameters"), [
+    (
+        "max(0.0001,((max(min(x,[1]),[0])<[12])*([11]))+((max(min(x,[1]),[0])>=[12])*"
+        "([2]+([3]/(pow(log10(max(min(x,[1]),[0])),2)+[4]))+"
+        "([5]*exp(-([6]*((log10(max(min(x,[1]),[0]))-[7])*(log10(max(min(x,[1]),[0]))-[7])))))+"
+        "([8]*exp(-([9]*((log10(max(min(x,[1]),[0]))-[10])*(log10(max(min(x,[1]),[0]))-[10]))))))))",
+        [2.9782283, 782.64795, 0.65412325, 4.7065787, 4.3917775, -0.10357406,
+         4.401645, 1.2357429, -0.67566425, 33.83841, -6.700246, 1.4943192, 8.0],
+    ),
+    (
+        "sqrt([2]*abs([2])/(max(min(x,[1]),[0])*max(min(x,[1]),[0]))+"
+        "[3]*[3]*pow(max(min(x,[1]),[0]),[5])+[4]*[4])",
+        [15., 1500., -1.27, .82, .027, -.54],
+    ),
+])
+def test_bound_jet_formula_matches_generic_ast(expression, parameters):
+    inputs = [{"name": n, "type": "real"} for n in ("rho", "pt")]
+    base = {"version": 1, "inputs": inputs, "output": {"name": "out", "type": "real"}}
+    formula = {"nodetype": "formula", "expression": expression,
+               "parser": "TFormula", "variables": ["pt"]}
+    bound = dict(base, name="bound", data=dict(formula, parameters=parameters))
+    reference = dict(base, name="reference", generic_formulas=[formula],
+                     data={"nodetype": "formularef", "index": 0, "parameters": parameters})
+    cset = core.CorrectionSet.from_string(json.dumps(
+        {"schema_version": 2, "corrections": [bound, reference]}))
+    # The L2 payload differs by one ULP at 57.21875 if pow(log10(pt),2)
+    # is strength-reduced to multiplication. Also exercise both clamp edges
+    # and both sides of its piecewise threshold.
+    values = [57.21875, -math.inf, math.inf, math.nan]
+    for cut in (parameters[0], parameters[1], 8.0):
+        values.extend([math.nextafter(cut, -math.inf), cut, math.nextafter(cut, math.inf)])
+    for pt in values:
+        expected = cset["reference"].evaluate(24., pt)
+        actual = cset["bound"].evaluate(24., pt)
+        assert struct.pack("d", actual) == struct.pack("d", expected)

@@ -1,5 +1,6 @@
 #ifndef CORRECTION_H
 #define CORRECTION_H
+#define CORRECTIONLIB_HAS_FORMULA_MATCH 1
 
 #include <array>
 #include <string>
@@ -7,6 +8,7 @@
 #include <variant>
 #include <map>
 #include <memory>
+#include <optional>
 #include "correctionlib_version.h"
 
 namespace correction {
@@ -130,7 +132,7 @@ class Formula {
     Formula(const JSONObject& json, const Correction& context, bool generic = false);
     Formula(const JSONObject& json, const std::vector<Variable>& inputs, bool generic = false);
     std::string expression() const { return expression_; };
-    const FormulaAst &ast() const { return *ast_; };
+    const FormulaAst &ast() const { return body_->ast; };
     double evaluate(const std::vector<Variable::Type>& values) const;
     double evaluate(const std::vector<Variable::Type>& values, const std::vector<double>& parameters) const;
 
@@ -138,9 +140,16 @@ class Formula {
 
   private:
     friend class BinnedFormulaGroup;
+    enum class JetFormula { None, L2Relative, PtResolution };
+    struct Body {
+      FormulaAst ast;
+      std::vector<double> jetParameters;
+      size_t jetPtIndex = 0;
+      JetFormula jetFormula = JetFormula::None;
+    };
     std::string expression_;
     FormulaAst::ParserType type_;
-    std::unique_ptr<FormulaAst> ast_;
+    std::unique_ptr<Body> body_;
     bool generic_;
     int affineVariable_ = -1;
 };
@@ -196,6 +205,7 @@ class Binning {
 
   private:
     friend class BinnedFormulaGroup;
+    friend class BinnedVariationGroup;
     std::variant<_UniformBins, _NonUniformBins> bins_; // bin edges
     // bin contents: contents_[i] is the value corresponding to bins_[i+1].
     // the default value is at contents_[0]
@@ -230,6 +240,8 @@ class Category {
     double evaluate(const std::vector<Variable::Type>& values) const;
 
   private:
+    friend class Correction;
+    friend class BinnedVariationGroup;
     typedef std::map<int, Content> IntMap;
     typedef std::map<std::string, Content> StrMap;
     std::variant<IntMap, StrMap> map_;
@@ -249,9 +261,16 @@ class Correction {
     Formula::Ref formula_ref(size_t idx) const { return formula_refs_.at(idx); };
     const Variable& output() const { return output_; };
     double evaluate(const std::vector<Variable::Type>& values) const;
+    /// Match a formula reached through fixed string categories. Pattern
+    /// parameters capture literal values; all operations and input indices
+    /// must agree. Other node types return an empty optional.
+    std::optional<std::vector<double>> match_formula(
+        const std::vector<Variable::Type>& values, const FormulaAst& pattern,
+        size_t parameter_count) const;
 
   private:
     friend class BinnedFormulaGroup;
+    friend class BinnedVariationGroup;
     std::string name_;
     std::string description_;
     int version_;
@@ -275,6 +294,31 @@ class BinnedFormulaGroup {
     BinnedFormulaGroup() = default;
     std::vector<double> outerEdges_, innerEdges_, defaults_;
     std::vector<std::array<double, 4>> coefficients_;
+};
+
+/// Prepared lookup for fixed string alternatives with identical numeric binning.
+/// Only supported constant-valued Binning and string Category trees are bound.
+class BinnedVariationGroup {
+  struct Plan;
+  std::shared_ptr<const Plan> plan_;
+  explicit BinnedVariationGroup(std::shared_ptr<const Plan> plan) : plan_(std::move(plan)) {}
+
+public:
+  class Workspace {
+    friend class BinnedVariationGroup;
+    std::shared_ptr<const Plan> plan_;
+    std::vector<double> coordinates_;
+    const std::vector<double>* leaf_ = nullptr;
+  };
+
+  /// String arguments for each case are in the original schema's string order.
+  /// Returns null for unsupported payloads or incompatible alternative layouts.
+  static std::unique_ptr<BinnedVariationGroup> prepare(
+      Correction::Ref correction, const std::vector<std::vector<std::string>>& stringCases);
+
+  /// Real coordinates are in the original schema's numeric order.
+  double evaluate(std::size_t variation, const double* coordinates, std::size_t size,
+                  Workspace& workspace) const;
 };
 
 typedef Correction::Ref CorrectionPtr; // deprecated

@@ -192,6 +192,43 @@ namespace {
     return product + p[1];
   }
 
+  // The reference AST rounds each operation to double and uses libm pow.
+  // Enable the shortcuts on the validated GNU/Linux target. In particular,
+  // a target with FMA could contract an affine term across AST boundaries.
+#if defined(__x86_64__) && defined(__GLIBC__) && defined(__GCC_IEC_559) && __GCC_IEC_559 >= 2 && \
+    defined(__FLT_EVAL_METHOD__) && __FLT_EVAL_METHOD__ == 0 && !defined(__FAST_MATH__) && \
+    !defined(__FMA__) && !defined(__FMA4__)
+  constexpr bool useBoundJetFormulas = true;
+#else
+  constexpr bool useBoundJetFormulas = false;
+#endif
+
+  constexpr std::string_view l2RelativeExpression =
+      "max(0.0001,((max(min(x,[1]),[0])<[12])*([11]))+((max(min(x,[1]),[0])>=[12])*"
+      "([2]+([3]/(pow(log10(max(min(x,[1]),[0])),2)+[4]))+"
+      "([5]*exp(-([6]*((log10(max(min(x,[1]),[0]))-[7])*(log10(max(min(x,[1]),[0]))-[7])))))+"
+      "([8]*exp(-([9]*((log10(max(min(x,[1]),[0]))-[10])*(log10(max(min(x,[1]),[0]))-[10]))))))))";
+  constexpr std::string_view ptResolutionExpression =
+      "sqrt([2]*abs([2])/(max(min(x,[1]),[0])*max(min(x,[1]),[0]))+"
+      "[3]*[3]*pow(max(min(x,[1]),[0]),[5])+[4]*[4])";
+
+  double evaluateL2Relative(double pt, const std::vector<double>& p) {
+    const double logPt = std::log10(pt);
+    const double firstOffset = logPt - p[7];
+    const double secondOffset = logPt - p[10];
+    // Folding pow(logPt, 2) into multiplication changes some results by one ULP.
+    const volatile double exponent = 2.;
+    const double response = p[2] + p[3] / (std::pow(logPt, exponent) + p[4])
+        + p[5] * std::exp(-(p[6] * (firstOffset * firstOffset)))
+        + p[8] * std::exp(-(p[9] * (secondOffset * secondOffset)));
+    return std::max(0.0001, (pt < p[12]) * p[11] + (pt >= p[12]) * response);
+  }
+
+  double evaluatePtResolution(double pt, const std::vector<double>& p) {
+    return std::sqrt(p[2] * std::abs(p[2]) / (pt * pt)
+                     + p[3] * p[3] * std::pow(pt, p[5]) + p[4] * p[4]);
+  }
+
   std::size_t find_bin_idx(const Variable::Type& value_variant,
                            const std::variant<_UniformBins, _NonUniformBins> &bins_,
                            const _FlowBehavior &flow,
@@ -391,7 +428,17 @@ Formula::Formula(const JSONObject& json, const std::vector<Variable>& inputs, bo
 
   if (generic && variableIdx.size() == 1 && expression_ == "[0]*max(min(x,[3]),[2])+[1]")
     affineVariable_ = static_cast<int>(variableIdx.front());
-  ast_ = std::make_unique<FormulaAst>(FormulaAst::parse(type_, expression_, params, variableIdx, !generic));
+  body_.reset(new Body{FormulaAst::parse(type_, expression_, params, variableIdx, !generic), {}});
+  if (useBoundJetFormulas && !generic && variableIdx.size() == 1) {
+    if (params.size() == 13 && expression_ == l2RelativeExpression)
+      body_->jetFormula = JetFormula::L2Relative;
+    else if (params.size() == 6 && expression_ == ptResolutionExpression)
+      body_->jetFormula = JetFormula::PtResolution;
+    if (body_->jetFormula != JetFormula::None) {
+      body_->jetPtIndex = variableIdx.front();
+      body_->jetParameters = std::move(params);
+    }
+  }
 }
 
 Formula::Ref Formula::from_string(const char * data, std::vector<Variable>& inputs) {
@@ -411,13 +458,19 @@ double Formula::evaluate(const std::vector<Variable::Type>& values) const {
   if ( generic_ ) {
     throw std::runtime_error("Generic formulas must be evaluated with parameters");
   }
-  return ast_->evaluate(values, {});
+  if (useBoundJetFormulas && body_->jetFormula != JetFormula::None) {
+    const auto& p = body_->jetParameters;
+    const double pt = std::max(std::min(std::get<double>(values[body_->jetPtIndex]), p[1]), p[0]);
+    return body_->jetFormula == JetFormula::L2Relative
+        ? evaluateL2Relative(pt, p) : evaluatePtResolution(pt, p);
+  }
+  return body_->ast.evaluate(values, {});
 }
 
 double Formula::evaluate(const std::vector<Variable::Type>& values, const std::vector<double>& params) const {
   if (affineVariable_ >= 0 && params.size() >= 4)
     return clampedAffine(std::get<double>(values[affineVariable_]), params.data());
-  return ast_->evaluate(values, params);
+  return body_->ast.evaluate(values, params);
 }
 
 FormulaRef::FormulaRef(const JSONObject& json, const Correction& context) {
@@ -756,6 +809,159 @@ double Correction::evaluate(const std::vector<Variable::Type>& values) const {
     inputs_[i].validate(values[i]);
   }
   return std::visit(node_evaluate{values}, data_);
+}
+
+std::optional<std::vector<double>> Correction::match_formula(
+    const std::vector<Variable::Type>& values, const FormulaAst& pattern,
+    size_t parameter_count) const {
+  if (values.size() != inputs_.size()) return std::nullopt;
+  for (size_t i = 0; i < inputs_.size(); ++i) inputs_[i].validate(values[i]);
+  const Content* node = &data_;
+  while (const auto* category = std::get_if<Category>(node)) {
+    const auto* branches = std::get_if<Category::StrMap>(&category->map_);
+    const auto* key = std::get_if<std::string>(&values[category->variableIdx_]);
+    if (!branches || !key) return std::nullopt;
+    const auto it = branches->find(*key);
+    node = it == branches->end() ? category->default_.get() : &it->second;
+    if (!node) return std::nullopt;
+  }
+  const auto* formula = std::get_if<Formula>(node);
+  if (!formula) return std::nullopt;
+
+  using Type = FormulaAst::NodeType;
+  std::vector<double> parameters(parameter_count);
+  std::vector<bool> seen(parameter_count, false);
+  const auto matches = [&](auto& self, const FormulaAst& actual, const FormulaAst& expected) -> bool {
+    if (expected.nodetype() == Type::Parameter) {
+      if (actual.nodetype() != Type::Literal) return false;
+      const auto i = std::get<size_t>(expected.data());
+      const auto value = std::get<double>(actual.data());
+      if (i >= parameter_count || !std::isfinite(value)) return false;
+      if (seen[i] && (parameters[i] != value || std::signbit(parameters[i]) != std::signbit(value)))
+        return false;
+      parameters[i] = value;
+      seen[i] = true;
+      return true;
+    }
+    if (expected.nodetype() != actual.nodetype() || expected.data() != actual.data() ||
+        expected.children().size() != actual.children().size()) return false;
+    if (expected.nodetype() == Type::Literal &&
+        std::signbit(std::get<double>(expected.data())) != std::signbit(std::get<double>(actual.data())))
+      return false;
+    for (size_t i = 0; i < expected.children().size(); ++i)
+      if (!self(self, actual.children()[i], expected.children()[i])) return false;
+    return true;
+  };
+  if (!matches(matches, formula->ast(), pattern) || std::find(seen.begin(), seen.end(), false) != seen.end())
+    return std::nullopt;
+  return parameters;
+}
+
+struct BinnedVariationGroup::Plan {
+  struct Node {
+    const Binning* table = nullptr;
+    std::size_t coordinate = 0;
+    std::vector<Node> children;
+    std::vector<double> values;
+  };
+  Correction::Ref correction;
+  std::size_t dimensions = 0;
+  std::size_t variations = 0;
+  Node root;
+};
+
+std::unique_ptr<BinnedVariationGroup> BinnedVariationGroup::prepare(
+    Correction::Ref correction, const std::vector<std::vector<std::string>>& stringCases) {
+  if (!correction || stringCases.size() < 2)
+    return nullptr;
+  auto plan = std::make_shared<Plan>();
+  plan->correction = std::move(correction);
+  plan->variations = stringCases.size();
+  std::vector<std::size_t> offsets;
+  std::size_t strings = 0;
+  for (const auto& input : plan->correction->inputs()) {
+    if (input.type() == Variable::VarType::integer) return nullptr;
+    offsets.push_back(input.type() == Variable::VarType::string ? strings++ : plan->dimensions++);
+  }
+  for (const auto& item : stringCases)
+    if (item.size() != strings) return nullptr;
+
+  const auto sameEdges = [](const Binning& a, const Binning& b) {
+    if (a.bins_.index() != b.bins_.index()) return false;
+    if (const auto* x = std::get_if<_UniformBins>(&a.bins_)) {
+      const auto& y = std::get<_UniformBins>(b.bins_);
+      return x->n == y.n && x->low == y.low && x->high == y.high;
+    }
+    return std::get<_NonUniformBins>(a.bins_) == std::get<_NonUniformBins>(b.bins_);
+  };
+  const auto build = [&](const auto& recurse, Plan::Node& node,
+                         std::vector<const Content*> contents) -> bool {
+    for (std::size_t variation = 0; variation < contents.size(); ++variation) {
+      auto*& content = contents[variation];
+      while (const auto* category = std::get_if<Category>(content)) {
+        const auto* map = std::get_if<Category::StrMap>(&category->map_);
+        if (!map) return false;
+        const auto result = map->find(stringCases[variation][offsets[category->variableIdx_]]);
+        content = result == map->end() ? category->default_.get() : &result->second;
+        if (!content) return false;
+      }
+    }
+    if (std::holds_alternative<double>(*contents.front())) {
+      for (const auto* content : contents) {
+        const auto* value = std::get_if<double>(content);
+        if (!value) return false;
+        node.values.push_back(*value);
+      }
+      return true;
+    }
+    const auto* first = std::get_if<Binning>(contents.front());
+    if (!first || plan->correction->inputs()[first->variableIdx_].type() != Variable::VarType::real)
+      return false;
+    std::vector<const Binning*> tables;
+    for (const auto* content : contents) {
+      const auto* table = std::get_if<Binning>(content);
+      if (!table || table->variableIdx_ != first->variableIdx_ ||
+          table->flow_ != first->flow_ || table->contents_.size() != first->contents_.size() ||
+          !sameEdges(*first, *table))
+        return false;
+      tables.push_back(table);
+    }
+    node.table = first;
+    node.coordinate = offsets[first->variableIdx_];
+    node.children.resize(first->contents_.size());
+    for (std::size_t bin = 0; bin < node.children.size(); ++bin) {
+      for (std::size_t variation = 0; variation < tables.size(); ++variation)
+        contents[variation] = &tables[variation]->contents_[bin];
+      if (!recurse(recurse, node.children[bin], contents)) return false;
+    }
+    return true;
+  };
+  if (!build(build, plan->root, std::vector<const Content*>(stringCases.size(), &plan->correction->data_)) ||
+      !plan->root.table)
+    return nullptr;
+  return std::unique_ptr<BinnedVariationGroup>(new BinnedVariationGroup(std::move(plan)));
+}
+
+double BinnedVariationGroup::evaluate(std::size_t variation, const double* coordinates,
+                                      std::size_t size, Workspace& workspace) const {
+  if (size != plan_->dimensions || variation >= plan_->variations)
+    throw std::invalid_argument("Binned variation lookup input count mismatch");
+  if (workspace.plan_ != plan_ ||
+      !std::equal(coordinates, coordinates + size, workspace.coordinates_.begin())) {
+    for (std::size_t i = 0; i < size; ++i)
+      if (!std::isfinite(coordinates[i]))
+        throw std::runtime_error("Non-finite binned variation coordinate");
+    auto* node = &plan_->root;
+    while (const auto* table = node->table) {
+      const auto bin = find_bin_idx(coordinates[node->coordinate], table->bins_, table->flow_,
+                                    table->variableIdx_, "Binning");
+      node = &node->children[bin];
+    }
+    workspace.coordinates_.assign(coordinates, coordinates + size);
+    workspace.plan_ = plan_;
+    workspace.leaf_ = &node->values;
+  }
+  return (*workspace.leaf_)[variation];
 }
 
 std::unique_ptr<BinnedFormulaGroup> BinnedFormulaGroup::prepare(
